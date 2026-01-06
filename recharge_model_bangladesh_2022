@@ -1,0 +1,236 @@
+/**
+ * WATER BALANCE RECHARGE MODEL: BANGLADESH (Production Ready - Final)
+ * Year: 2022
+ * R = P - ET - Q - dS+
+ * 
+ * CORRECTIONS APPLIED:
+ * 1. IMERG: Removed incorrect 0.5 scaling
+ * 2. GLDAS: Temporal differencing of accumulators (v2.1 correct method)
+ * 3. Fixed spatial reduction bug
+ * 4. Added QC masking to MODIS ET
+ * 5. Added explicit reprojection to common grid
+ * 6. Corrected storage change units
+ * 7. Consistent export resolution
+ */
+
+// --- 1. GEOGRAPHY ---
+var bd = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+  .filter(ee.Filter.eq('country_na', 'Bangladesh'));
+Map.centerObject(bd, 7);
+
+// --- 2. TIME PARAMETERS ---
+var year = 2022; 
+var start = ee.Date.fromYMD(year, 1, 1);
+var end = start.advance(1, 'year');
+
+// --- 3. PRECIPITATION (P) - IMERG V07 ---
+// CORRECTED: No scaling needed - precipitation band is already mm/half-hour
+var P = ee.ImageCollection("NASA/GPM_L3/IMERG_V07")
+  .filterDate(start, end)
+  .select('precipitation')
+  .sum() // Direct sum gives annual mm
+  .clip(bd)
+  .rename('P');
+
+print('P bands:', P.bandNames());
+
+// --- 4. EVAPOTRANSPIRATION (ET) - MODIS MOD16A2 ---
+// CORRECTED: Added QC masking
+var ET = ee.ImageCollection("MODIS/061/MOD16A2")
+  .filterDate(start, end)
+  .select(['ET', 'ET_QC'])
+  .map(function(img) {
+    var qc = img.select('ET_QC');
+    var good = qc.eq(0); // QC = 0 means good quality
+    return img.select('ET')
+      .multiply(0.1) // Scale factor: 0.1 to convert to mm/8day
+      .updateMask(good);
+  })
+  .sum()
+  .clip(bd)
+  .rename('ET');
+
+print('ET bands:', ET.bandNames());
+
+// --- 5. RUNOFF (Q) - GLDAS NOAH v2.1 ---
+// CORRECTED: Temporal differencing of accumulators (NASA-recommended method)
+var gldasFull = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H")
+  .filterDate(start, end);
+
+var gldasRunoff = gldasFull.select(['Qs_acc', 'Qsb_acc']);
+
+// Sort explicitly by time (critical for differencing)
+gldasRunoff = gldasRunoff.sort('system:time_start');
+
+print('GLDAS collection size:', gldasFull.size());
+
+// Compute timestep runoff by temporal differencing
+var Q = ee.ImageCollection(
+  ee.List.sequence(1, gldasRunoff.size().subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var curr = ee.Image(gldasRunoff.toList(gldasRunoff.size()).get(i));
+    var prev = ee.Image(gldasRunoff.toList(gldasRunoff.size()).get(i.subtract(1)));
+
+    // Difference of accumulators → timestep runoff (mm)
+    // Qs_acc and Qsb_acc are in kg m⁻² ≡ mm
+    var runoff = curr.subtract(prev)
+      .rename(['Qs', 'Qsb'])
+      .reduce(ee.Reducer.sum()) // Sum surface + subsurface
+      .rename('Q_step');
+
+    return runoff.copyProperties(curr, ['system:time_start']);
+  })
+)
+.sum() // Annual total runoff
+.clip(bd)
+.rename('Q');
+
+print('Q bands:', Q.bandNames());
+
+// --- 6. MONSOON STORAGE GAIN (dS+) ---
+// CORRECTED: Proper unit handling (kg/m² ≡ mm)
+var sm = gldasFull.select('RootMoist_inst'); // kg/m²
+
+// Dates: Feb-Mar (Dry) vs Jul-Sep (Wet)
+var sm_pre = sm.filterDate(year+'-02-01', year+'-03-31').mean(); 
+var sm_peak = sm.filterDate(year+'-07-01', year+'-09-30').mean(); 
+
+// kg/m² is already equivalent to mm water depth
+var dS_pos = sm_peak.subtract(sm_pre)
+  .max(0) // Only positive storage gains
+  .clip(bd)
+  .rename('dS_pos')
+  .unmask(0);
+
+print('dS_pos bands:', dS_pos.bandNames());
+
+// --- 7. SPATIAL HARMONIZATION ---
+// CORRECTED: Explicit reprojection to common grid (IMERG ~10 km)
+var targetProj = P.projection();
+
+ET = ET.reproject({crs: targetProj, scale: 10000});
+Q = Q.reproject({crs: targetProj, scale: 10000});
+dS_pos = dS_pos.reproject({crs: targetProj, scale: 10000});
+
+print('Target projection:', targetProj);
+
+// --- 8. FINAL RECHARGE CALCULATION ---
+// R = P - ET - Q - dS+
+var Recharge = P.subtract(ET).subtract(Q).subtract(dS_pos)
+  .max(0) // No negative recharge
+  .rename('Recharge');
+
+// --- 9. VISUALIZATION ---
+var rVis = {
+  min: 0, 
+  max: 600, 
+  palette: ['#d73027', '#fc8d59', '#fee08b', '#d9ef8b', '#91bfdb', '#4575b4']
+};
+
+// Add component layers for validation
+Map.addLayer(P, {min: 0, max: 3000, palette: ['white', 'blue']}, 
+  'Precipitation (mm)', false);
+Map.addLayer(ET, {min: 0, max: 1500, palette: ['white', 'red']}, 
+  'Evapotranspiration (mm)', false);
+Map.addLayer(Q, {min: 0, max: 1000, palette: ['white', 'orange']}, 
+  'Runoff (mm)', false);
+Map.addLayer(dS_pos, {min: 0, max: 200, palette: ['white', 'green']}, 
+  'Storage Gain (mm)', false);
+Map.addLayer(Recharge, rVis, 'Potential Vertical Recharge 2022 (mm)');
+
+// --- 10. ZONAL STATISTICS ---
+var stats = Recharge.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: bd.geometry(),
+  scale: 10000, // Consistent with calculation resolution
+  maxPixels: 1e13
+});
+
+print('National Mean Recharge (mm/yr):', stats.get('Recharge'));
+
+// Comprehensive statistics for all components
+var componentStats = ee.Dictionary({
+  P: P.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: bd.geometry(),
+    scale: 10000,
+    maxPixels: 1e13
+  }),
+  ET: ET.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: bd.geometry(),
+    scale: 10000,
+    maxPixels: 1e13
+  }),
+  Q: Q.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: bd.geometry(),
+    scale: 10000,
+    maxPixels: 1e13
+  }),
+  dS_pos: dS_pos.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: bd.geometry(),
+    scale: 10000,
+    maxPixels: 1e13
+  }),
+  Recharge: stats
+});
+
+print('Water Balance Components (National Mean, mm/yr):', componentStats);
+
+// Additional recharge statistics
+var rechargeStats = Recharge.reduceRegion({
+  reducer: ee.Reducer.mean()
+    .combine(ee.Reducer.stdDev(), '', true)
+    .combine(ee.Reducer.min(), '', true)
+    .combine(ee.Reducer.max(), '', true),
+  geometry: bd.geometry(),
+  scale: 10000,
+  maxPixels: 1e13
+});
+
+print('Recharge Statistics (mm/yr):', rechargeStats);
+
+// --- 11. EXPORT ---
+// CORRECTED: Export at calculation resolution (10 km)
+Export.image.toDrive({
+  image: Recharge,
+  description: 'Bangladesh_Recharge_2022_Final',
+  scale: 10000, // Consistent with calculation
+  region: bd.geometry(),
+  maxPixels: 1e13,
+  crs: targetProj
+});
+
+// Export water balance components for validation
+var waterBalance = P.addBands(ET).addBands(Q).addBands(dS_pos).addBands(Recharge);
+
+Export.image.toDrive({
+  image: waterBalance,
+  description: 'Bangladesh_WaterBalance_2022_AllComponents',
+  scale: 10000,
+  region: bd.geometry(),
+  maxPixels: 1e13,
+  crs: targetProj
+});
+
+// Export separate runoff components for diagnostic purposes
+var gldasDiagnostic = ee.ImageCollection(
+  ee.List.sequence(1, gldasRunoff.size().subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var curr = ee.Image(gldasRunoff.toList(gldasRunoff.size()).get(i));
+    var prev = ee.Image(gldasRunoff.toList(gldasRunoff.size()).get(i.subtract(1)));
+    
+    var diff = curr.subtract(prev).rename(['Qs_step', 'Qsb_step']);
+    return diff.copyProperties(curr, ['system:time_start']);
+  })
+);
+
+var Qs_annual = gldasDiagnostic.select('Qs_step').sum().clip(bd);
+var Qsb_annual = gldasDiagnostic.select('Qsb_step').sum().clip(bd);
+
+Map.addLayer(Qs_annual, {min: 0, max: 800, palette: ['white', 'orange', 'red']}, 
+  'Surface Runoff (Qs, mm)', false);
+Map.addLayer(Qsb_annual, {min: 0, max: 400, palette: ['white', 'lightblue', 'blue']}, 
+  'Subsurface Runoff (Qsb, mm)', false);
